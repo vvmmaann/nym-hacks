@@ -12,8 +12,8 @@
 #   clock speed      - strongest single predictor across the fleet
 #   steal time       - how much CPU the hypervisor takes from you
 #   jitter           - whether your vCPU gets descheduled under load
-#   buffer setting   - should be the default (Nym asked to revert the 1000 workaround)
-#   live test        - optional: wait for the next stress test and watch the node take it
+#   buffer setting   - should be the default 192
+#   live test        - with --wait-test: drops and the busiest thread during a real test
 #
 # Read-only. Changes nothing.
 #
@@ -130,19 +130,18 @@ if [ -n "$CFG" ]; then
   BUF=$(grep -oP '^\s*maximum_connection_buffer_size\s*=\s*\K[0-9]+' "$CFG" 2>/dev/null | head -1)
   if [ -n "$BUF" ] && [ "$BUF" -ne 192 ]; then
     echo "  maximum_connection_buffer_size = $BUF  (default 192)"
-    flag "egress buffer set to $BUF - Nym asked to revert it: comment it out and restart nym-node"
+    flag "egress buffer set to $BUF - remove it from config.toml and restart nym-node"
   else
-    echo "  >> egress buffer at the default (192), as Nym recommends"
+    echo "  >> egress buffer at the default (192)"
   fi
 else
   echo "  no nym-node config found"
 fi
 
 # ------------------------------------------------------------- live test --
-# The tester pushes all its packets through ONE connection, far faster than any real peer
-# (real peers carry well under 100 KB/s each; the 45k test runs at ~600 KB/s for ~30 s).
-# Wait for a connection that moves >150 KB in a second and at least 5x the next busiest one,
-# then watch nym-node's busiest thread and the drop counter for ~90 s.
+# The tester sends the whole test over one connection at ~600 KB/s for ~30 s. Another mixnode
+# can burst to ~800 KB/s for 5-8 s, so a test = the same connection above 150 KB/s for 12 s,
+# gaps up to 3 s. Recording starts at its first second and restarts on a new candidate.
 if [ "$WAIT_TEST" -eq 1 ]; then
   hr "LIVE STRESS TEST  (waits up to 3h)"
   M="http://127.0.0.1:$PORT/api/v1/metrics/mixing"
@@ -154,21 +153,32 @@ if [ "$WAIT_TEST" -eq 1 ]; then
     cnt(){ curl -s -m 3 "$M" | grep -o "\"$1_since_startup\":[0-9]*" | cut -d: -f2; }
     conns(){ ss -Htin state established '( sport = :1789 )' 2>/dev/null | awk '
       /^[ \t]/ { if (match($0, /bytes_received:[0-9]+/)) print p, substr($0, RSTART + 15, RLENGTH - 15); next } { p = $4 }'; }
-    echo "  waiting for the next stress test (roughly every 2 hours)..."
-    conns > "$O/a"; END=$((SECONDS + 10800)); HIT=""
+    echo "  waiting for the next stress test..."
+    conns > "$O/a"; END=$((SECONDS + 10800)); CAND=""; HITS=0; MISS=0; TOPPID=""
     while [ "$SECONDS" -lt "$END" ]; do
       sleep 1; conns > "$O/b"
-      HIT=$(awk 'NR == FNR { p[$1] = $2; next }
-                 { d = ($1 in p) ? $2 - p[$1] : $2; if (d > a) { b = a; a = d; h = $1 } else if (d > b) b = d }
-                 END { if (a > 150000 && a > 5 * b) print h }' "$O/a" "$O/b")
-      mv "$O/b" "$O/a"; [ -n "$HIT" ] && break
+      read -r TP TD < <(awk 'NR == FNR { p[$1] = $2; next }
+                 { d = ($1 in p) ? $2 - p[$1] : $2; if (d > a) { a = d; h = $1 } }
+                 END { print h " " a + 0 }' "$O/a" "$O/b")
+      mv "$O/b" "$O/a"
+      if [ "${TD:-0}" -gt 150000 ] && [ "$TP" = "$CAND" ]; then
+        HITS=$((HITS + 1)); MISS=0
+      elif [ "${TD:-0}" -gt 150000 ]; then          # a new candidate: start recording now
+        [ -n "$TOPPID" ] && kill "$TOPPID" 2>/dev/null
+        CAND="$TP"; HITS=1; MISS=0
+        T0=$(date -u +%T); R0=$(cnt received); D0=$(cnt dropped)
+        top -H -b -d 1 -n 60 -p "$NPID" > "$O/top" 2>/dev/null & TOPPID=$!
+      elif [ -n "$CAND" ]; then
+        MISS=$((MISS + 1))
+        if [ "$MISS" -gt 3 ]; then kill "$TOPPID" 2>/dev/null; CAND=""; HITS=0; TOPPID=""; fi
+      fi
+      [ "$HITS" -ge 12 ] && break
     done
-    if [ -z "$HIT" ]; then
+    if [ "$HITS" -lt 12 ]; then
       echo "  no stress test seen in 3 hours - run with --wait-test again later"
     else
-      T0=$(date -u +%T); R0=$(cnt received); D0=$(cnt dropped)
-      top -H -b -d 1 -n 60 -p "$NPID" > "$O/top" 2>/dev/null &
-      sleep 90
+      HIT="$CAND"
+      sleep 75
       RX=$(( $(cnt received) - R0 )); DR=$(( $(cnt dropped) - D0 ))
       # busiest thread per 1 s frame; test seconds = frames where it is above 10%
       read -r AVG HOT TOT < <(awk '/^top -/ { if (n) f[c++] = m; n = 1; m = 0; next }
@@ -179,9 +189,9 @@ if [ "$WAIT_TEST" -eq 1 ]; then
       echo "  packets : received +$RX, dropped +$DR"
       echo "  busiest nym-node thread : avg ${AVG}%, ${HOT} of ${TOT} test seconds at 95%+"
       if [ "$DR" -gt 0 ] && [ "$TOT" -gt 0 ] && [ $(( HOT * 2 )) -ge "$TOT" ]; then
-        flag "during the stress test one nym-node thread sat at ~100% and $DR packets were dropped - this core is too slow"
+        flag "$DR packets dropped while one nym-node thread was at 95%+ for half the test or more - the core is too slow"
       elif [ "$DR" -gt 0 ]; then
-        flag "$DR packets dropped during the stress test while no thread was pinned - not a CPU limit, look at the network"
+        flag "$DR packets dropped with no thread pinned - core speed is not the bottleneck"
       else
         echo "  >> the node took the stress test without drops"
       fi
